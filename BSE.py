@@ -3225,7 +3225,7 @@ if __name__ == "__main__":
     # set up common parameters for all market sessions
     # 1000 days is often good, but 3*365=1095, so may as well go for three years.
     n_days = 1
-    hours_in_a_day = 24     # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
+    hours_in_a_day = 1     # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
     start_time = 0.0
     end_time = 60.0 * 60.0 * hours_in_a_day * n_days
     duration = end_time - start_time
@@ -3394,7 +3394,7 @@ if __name__ == "__main__":
     # now run a sequence of trials, one session per trial
 
     # if verbose = True, print a running commentary describing what's going on.
-    verbose = False
+    verbose = True
 
     # n_trials is how many trials (i.e. market sessions) to run in total
     n_trials = 1
@@ -3410,14 +3410,15 @@ if __name__ == "__main__":
         trial_id = 'bse_d%03d_i%02d_%04d' % (n_days, order_interval, trial)
 
         # buyer_spec specifies the strategies played by buyers, and for each strategy how many such buyers to create
-        buyers_spec = [('SHVR', 5), ('GVWY', 5), ('ZIC', 2), ('ZIP', 13)]
+        buyers_spec = [('ZIC', 10), ('ZIP', 10)]
         #     ('PRZI', 5, {'s_min': -1.0, 's_max': +1.0})]
 
         # seller_spec specifies the strategies played by sellers, and for each strategy how many such sellers to create
         sellers_spec = buyers_spec
 
         # proptraders_spec specifies strategies played by proprietary-traders, and how many of each
-        proptraders_spec = [('PT1', 1, {'bid_percent': 0.95, 'ask_delta': 7}), ('PT2', 1, {'n_past_trades': 25})]
+        # proptraders_spec = [('PT1', 1, {'bid_percent': 0.95, 'ask_delta': 7}), ('PT2', 1, {'n_past_trades': 25})]
+        proptraders_spec = []
 
         # trader_spec wraps up the specifications for the buyers, sellers, and proptraders
         traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
