@@ -56,14 +56,19 @@ import random
 import os
 import time as chrono
 import csv
+import pygad
 from datetime import datetime
+import numpy as np
+
+NUM_GENES = 5
+GENE_BOUNDS = {"low": -1.0, "high": 1.0}
 
 # a bunch of system constants (globals)
 bse_sys_minprice = 1                    # minimum price in the system, in cents/pennies
 bse_sys_maxprice = 500                  # maximum price in the system, in cents/pennies
 # ticksize should be a param of an exchange (so different exchanges can have different ticksizes)
 ticksize = 1  # minimum change in price, in cents/pennies
-
+currGene = {}
 
 # an Order/quote has a trader id, a type (buy/sell) price, quantity, timestamp, and unique i.d.
 class Order:
@@ -483,6 +488,47 @@ class Exchange(Orderbook):
 
         return public_data
 
+
+class GAEvolver:
+    def __init__(self, popSize=20, numGen=30, sessionBuilder=None):
+        self.popSize = popSize
+        self.numGen = numGen
+        self.sessionBuilder = sessionBuilder
+        self.bestGene = None
+        self.ga = None
+    
+    def fitness(self, ga, solution, solIndex):
+        NUM_SESS = 3
+        profit = [self.sessionBuilder(solution) for i in range(NUM_SESS)]
+        return sum(profit) / len(profit)
+        
+    
+    def evolve(self):
+        self.ga = pygad.GA(
+            num_generations=self.numGen,
+            num_parents_mating=max(2, self.popSize // 4),
+            fitness_func=self.fitness,
+            sol_per_pop=self.popSize,
+            num_genes=NUM_GENES,
+            gene_space=GENE_BOUNDS,
+            parent_selection_type="tournament",
+            crossover_type="single_point",
+            mutation_type="random",
+            mutation_probability=0.15,
+            keep_elitism=2,
+            stop_criteria=f"saturate_{self.numGen // 3}",
+            parallel_processing=None,
+        )
+        self.ga.run()
+        solution, fitness, solIndex = self.ga.best_solution()
+        self.bestGene = solution
+        print(f"GA Trader Best Profit: {fitness:.4f}")
+        print(f"GA Trader Best Gene: {solution}")
+
+    def plot(self):
+        if self.ga:
+            self.ga.plot_fitness()
+        
 
 # #################--Traders below here--#############
 
@@ -1540,7 +1586,7 @@ class TraderPRZI(Trader):
 class TraderZIP(Trader):
     """
     The Zero-Intelligence-Plus (ZIP) adaptive trading strategy of Cliff (1997).
-    The code here implements the original ZIP, and also the strategy-optimizing variuants ZIPSH and ZIPDE.
+    The code here implements the original ZIP, and also the strategy-optimizing variants ZIPSH and ZIPDE.
     """
 
     # ZIP init key param-values are those used in Cliff's 1997 original HP Labs tech report
@@ -2504,6 +2550,99 @@ class TraderPT2(Trader):
 
     # end of PT2 definition
 
+
+class TraderGA(Trader):
+    def __init__(self, ttype, tid, balance, params, time):
+        super().__init__(ttype, tid, balance, params, time)
+
+        self.sessionProfit = 0.0
+        # print(f"GA PARAMS: {params}")
+        if isinstance(params, dict) and "genes" in params:
+            self.genes = np.array(params["genes"], dtype=float)
+            print(f"GENE IN TRADER: {self.genes}")
+        else:
+            self.genes = np.random.uniform(GENE_BOUNDS[0], GENE_BOUNDS[1], size=NUM_GENES)
+        # gene = self.genes
+        self.shadeFactor = self.genes[0]
+        self.lobBidW = self.genes[1]
+        self.lobAskW = self.genes[2]
+        self.spreadSensitivity = self.genes[3]
+        self.aggression = self.genes[4]
+    
+    def getQuote(self, lob, order):
+        limit = order.price
+        oType = order.otype
+
+        bestBid = lob["bids"]["best"] if lob["bids"]["best"] is not None else limit
+        bestAsk = lob["asks"]["best"] if lob["asks"]["best"] is not None else limit
+        mid = (bestBid + bestAsk) / 2
+        spread = (bestAsk - bestBid) if (bestAsk is not None and bestBid is not None and (bestAsk-bestBid) >= 1) else 1
+        relPos = (limit - mid) / spread
+
+        weightSig = (self.lobBidW * (bestBid / limit)) + (self.lobAskW * (bestAsk / limit)) + (self.spreadSensitivity * (spread / limit)) + (self.aggression * relPos)
+        shade = self.shadeFactor * weightSig * 0.1
+        # print(f"SHADE: {shade}")
+
+        if oType == "Bid":
+            quote = limit * (1.0 + shade)
+            quote = min(quote, limit)
+        else:
+            quote = limit * (1.0 - shade)
+            quote = max(quote, limit)
+        return int(round(quote))
+    
+    def getorder(self, time, countdown, lob):
+        # print(f"[GETORDER] CALLED, orders={self.orders}")
+        # this test for negative countdown is purely to stop PyCharm warning about unused parameter value
+        if countdown < 0:
+            sys.exit('Negative countdown')
+
+        if len(self.orders) < 1:
+            # no orders: return NULL
+            order = None
+        else:
+            order = self.orders[0] # assumes there is only ever 1 order
+            self.currentLimit = order.price
+            qid = lob["QID"]
+            quotePrice = self.getQuote(lob, order)
+            order = Order(self.tid, order.otype, quotePrice, self.orders[0].qty, time, qid)
+            self.lastquote = order
+        return order
+    
+    def respond(self, time, lob, trade, vrbs):
+        self.profitpertime = self.profitpertime_update(time, self.birthtime, self.balance)
+        return None
+
+    def bookkeep(self, time, trade, order, vrbs):
+        # print(f"[BOOKKEEP] CALLED, trade={trade}, order={order}")
+        outstr = ""
+        for i in self.orders:
+            outstr = outstr + str(i)
+        self.blotter.append(trade)
+
+        limit = self.currentLimit
+
+        profit = 0.0
+        if self.lastquote.otype == "Bid":
+            profit = limit - trade["price"]
+        else:
+            profit = trade["price"] - limit
+        
+        self.balance += profit
+        self.sessionProfit += profit
+        self.n_trades += 1
+        self.profitpertime = self.balance / (time - self.birthtime)
+
+        if profit < 0:
+            print(profit)
+            print(trade)
+            print(order)
+            sys.exit('FAIL: negative profit')
+
+        if vrbs:
+            print(f"{outstr} profit={profit} balance={self.balance} profit/time={str(self.profitpertime)}" % (outstr, profit, self.balance, str(self.profitpertime)))
+        self.del_order(order)
+
 # ########################---trader-types have all been defined now--################
 
 
@@ -2586,6 +2725,8 @@ def populate_market(trdrs_spec, traders, shuffle, vrbs):
         time0 = 0
         if robottype == 'GVWY':
             return TraderGiveaway('GVWY', name, balance, parameters, time0)
+        elif robottype == "GA":
+            return TraderGA("GA", name, balance, parameters, time0)
         elif robottype == 'ZIC':
             return TraderZIC('ZIC', name, balance, parameters, time0)
         elif robottype == 'SHVR':
@@ -2666,6 +2807,8 @@ def populate_market(trdrs_spec, traders, shuffle, vrbs):
                                   'strat_min': trader_params['s_min'], 'strat_max': trader_params['s_max']}
             else:
                 sys.exit('FAIL: PRZI/PRSH/PRDE trader needs one or more parameters to be specified')
+        if ttype == "GA":
+            parameters = trader_params
                 
         # for PT1/PT2 the parameters are optional...
         # ...and are unpacked in __init__, so here they're just passed straight on through
@@ -3211,10 +3354,59 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
         lobframes.close()
 
 
+def gaProfitFromDump(profitFile):
+    profit = 0.0
+
+    try:
+        with open(profitFile, newline="") as f:
+            reader = list(csv.reader(f))
+            lastRow = reader[-1]
+        gaIndex = lastRow.index(" GA")
+        profit = float(lastRow[gaIndex+3])
+        print(lastRow)
+        return profit
+    except FileNotFoundError:
+        pass
+    return profit
+        
+
+def sessionForGene(gene):
+    # Pretty good Gene -> [ 0.92209201 -0.49358457 -0.7124296  -0.06062575 -0.19027896]
+    tid = "ga_trial"
+
+    dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True, 'dump_avgbals': True, 'dump_tape': True}
+
+    order_sched = {'sup': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
+                   'dem': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
+                   'interval': 10,
+                   'timemode': 'drip-poisson'}
+    buyers_spec = [("ZIC", 10), ("GA", 1, {"genes": gene.tolist()})]
+    sellers_spec = [("ZIC", 10)]
+    # print(f"GENE PRE SUB: {gene}")
+    proptraders_spec = []
+    traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
+
+    market_session(tid, 0, 1200, traders_spec, order_sched, dump_flags, False)
+    gaProfit = gaProfitFromDump(f"{tid}_avg_balance.csv")
+    return gaProfit
+
+
+
+
 #############################
 # # Below here is where we set up and run a whole series of experiments
 
 if __name__ == "__main__":
+
+    evolver = GAEvolver(
+        popSize=20,
+        numGen=30,
+        sessionBuilder=sessionForGene
+    )
+    evolver.evolve()
+    bestGene = evolver.bestGene
+
+    # # @TODO Now that the program is outputting a "Best Gene", implement that gene in the experiment below.
 
     price_offset_filename = 'offset_BTC_USD_20250211.csv'
 
@@ -3410,11 +3602,11 @@ if __name__ == "__main__":
         trial_id = 'bse_d%03d_i%02d_%04d' % (n_days, order_interval, trial)
 
         # buyer_spec specifies the strategies played by buyers, and for each strategy how many such buyers to create
-        buyers_spec = [('ZIC', 10), ('ZIP', 10)]
+        buyers_spec = [('ZIC', 10), ('ZIP', 10), ("GA", 1, {"genes": bestGene.tolist()})]
         #     ('PRZI', 5, {'s_min': -1.0, 's_max': +1.0})]
 
         # seller_spec specifies the strategies played by sellers, and for each strategy how many such sellers to create
-        sellers_spec = buyers_spec
+        sellers_spec = [('ZIC', 10), ('ZIP', 10)]
 
         # proptraders_spec specifies strategies played by proprietary-traders, and how many of each
         # proptraders_spec = [('PT1', 1, {'bid_percent': 0.95, 'ask_delta': 7}), ('PT2', 1, {'n_past_trades': 25})]

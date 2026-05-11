@@ -91,3 +91,43 @@ class GATrader(bse.Trader):
         if vrbs:
             print(f"{outstr} profit={profit} balance={self.balance} profit/time={str(self.profitpertime)}" % (outstr, profit, self.balance, str(self.profitpertime)))
         self.del_order(order)
+
+
+class GAEvolver:
+    def __init__(self, popSize=20, numGen=30, sessionBuilder=None):
+        self.popSize = popSize
+        self.numGen = numGen
+        self.sessionBuilder = sessionBuilder
+        self.bestGene = None
+        self.ga = None
+    
+    def fitness(self, ga, solution):
+        profit = self.sessionBuilder(solution)
+        return float(profit)
+    
+    def evolve(self):
+        self.ga = pygad.GA(
+            num_generations=self.numGen,
+            num_parents_mating=max(2, self.popSize // 4),
+            fitness_func=self.fitness,
+            sol_per_pop=self.popSize,
+            num_genes=NUM_GENES,
+            gene_space=GENE_BOUNDS,
+            parent_selection_type="tournament",
+            crossover_probability="single_point",
+            mutation_type="random",
+            mutation_probability=0.15,
+            keep_elitism=2,
+            stop_criteria=f"saturate_{self.numGen // 3}",
+            parallel_processing=None,
+        )
+        self.ga.run()
+        solution, fitness, solIndex = self.ga.instance.best_solution()
+        self.bestGene = solution
+        print(f"GA Trader Best Profit: {fitness:.4f}")
+        print(f"GA Trader Best Gene: {solution}")
+
+    def plot(self):
+        if self.ga:
+            self.ga.plot_fitness()
+        
