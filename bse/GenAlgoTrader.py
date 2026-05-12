@@ -1,7 +1,7 @@
 import pygad
 import numpy as np
 import random
-import BSE as bse
+import bse.BSE as bse
 import sys
 
 NUM_GENES = 5
