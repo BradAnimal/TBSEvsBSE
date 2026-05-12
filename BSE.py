@@ -57,6 +57,7 @@ import os
 import time as chrono
 import csv
 import pygad
+import pickle
 from datetime import datetime
 import numpy as np
 
@@ -69,6 +70,7 @@ bse_sys_maxprice = 500                  # maximum price in the system, in cents/
 # ticksize should be a param of an exchange (so different exchanges can have different ticksizes)
 ticksize = 1  # minimum change in price, in cents/pennies
 currGene = {}
+prevRLTrader = None
 
 # an Order/quote has a trader id, a type (buy/sell) price, quantity, timestamp, and unique i.d.
 class Order:
@@ -498,7 +500,7 @@ class GAEvolver:
         self.ga = None
     
     def fitness(self, ga, solution, solIndex):
-        NUM_SESS = 3
+        NUM_SESS = 5
         profit = [self.sessionBuilder(solution) for i in range(NUM_SESS)]
         return sum(profit) / len(profit)
         
@@ -2562,7 +2564,7 @@ class TraderGA(Trader):
             print(f"GENE IN TRADER: {self.genes}")
         else:
             self.genes = np.random.uniform(GENE_BOUNDS[0], GENE_BOUNDS[1], size=NUM_GENES)
-        # gene = self.genes
+
         self.shadeFactor = self.genes[0]
         self.lobBidW = self.genes[1]
         self.lobAskW = self.genes[2]
@@ -2573,14 +2575,14 @@ class TraderGA(Trader):
         limit = order.price
         oType = order.otype
 
-        bestBid = lob["bids"]["best"] if lob["bids"]["best"] is not None else limit
-        bestAsk = lob["asks"]["best"] if lob["asks"]["best"] is not None else limit
+        bestBid = lob["bids"]["best"] or limit
+        bestAsk = lob["asks"]["best"] or limit
         mid = (bestBid + bestAsk) / 2
-        spread = (bestAsk - bestBid) if (bestAsk is not None and bestBid is not None and (bestAsk-bestBid) >= 1) else 1
-        relPos = (limit - mid) / spread
+        spread = (bestAsk - bestBid) if (bestAsk and bestBid and (bestAsk-bestBid) >= 1) else 1
+        relPos = max(-3, min(3, (limit - mid) / spread))
 
         weightSig = (self.lobBidW * (bestBid / limit)) + (self.lobAskW * (bestAsk / limit)) + (self.spreadSensitivity * (spread / limit)) + (self.aggression * relPos)
-        shade = self.shadeFactor * weightSig * 0.1
+        shade = max(-0.4, min(0.4, self.shadeFactor * weightSig * 0.1))
         # print(f"SHADE: {shade}")
 
         if oType == "Bid":
@@ -2640,8 +2642,131 @@ class TraderGA(Trader):
             sys.exit('FAIL: negative profit')
 
         if vrbs:
-            print(f"{outstr} profit={profit} balance={self.balance} profit/time={str(self.profitpertime)}" % (outstr, profit, self.balance, str(self.profitpertime)))
+            print(f"{outstr} profit={profit} balance={self.balance} profit/time={str(self.profitpertime)}")
         self.del_order(order)
+
+
+class TraderRL(Trader):
+    def __init__(self, ttype, tid, balance, params, time):
+        super().__init__(ttype, tid, balance, params, time)
+
+        self.countdown = 1
+
+        if isinstance(params, dict) and ("minVal" in params and "maxVal" in params):
+            self.minVal = params.get("minVal", 75)
+            self.maxVal = params.get("maxVal", 200)
+
+        if isinstance(params, dict) and ("prevRLTrader" in params and params["prevRLTrader"]):
+            # print(f"EPSILON: {params["prevRLTrader"]["epsilon"]}")
+            self.stateSize = params["prevRLTrader"]["stateSize"]
+            self.actionSize = params["prevRLTrader"]["actionSize"]
+            self.qTable = params["prevRLTrader"]["qTable"]
+            self.epsilon = max(params["prevRLTrader"]["epsilon"] * 0.995, 0.006)
+            self.alpha = params["prevRLTrader"]["alpha"]
+            self.gamma = params["prevRLTrader"]["gamma"] 
+            self.lastState = None
+            self.lastAction = None
+            # print(f"SELF EPSILON: {self.epsilon}")
+        else:
+            self.stateSize = 6
+            self.actionSize = 10
+            self.qTable = {}
+            self.epsilon = 1.0 #exploration vs. exploitation rate: decays to 0 as the model learns to trust what it learns
+            self.alpha = 0.1
+            self.gamma = 0.95 # 0 -> 1 is how much the agent cares abt future rewards
+            self.lastState = None
+            self.lastAction = None
+    
+    def getorder(self, time, countdown, lob):
+        if not self.orders:
+            return None
+        
+        # print(f"TIME: {time}, COUNTDOWN: {countdown}")
+        state = self.getState(lob, countdown)
+        action = self.chooseAction(state)
+        price = self.actionToPrice(action)
+
+        # print(f"GETORDER State: {state}; Action: {action}; Price {price}")
+        self.lastState = state
+        self.lastAction = action
+        self.countdown = countdown
+
+        if self.orders:
+            order = Order(self.tid, self.orders[0].otype, price, 1, time, lob["QID"])
+            self.lastquote = order
+            return order
+        return None
+    
+    def respond(self, time, lob, trade, vrbs):
+        reward = self.computeReward(trade)
+        newState = self.getState(lob, 0)
+        if self.lastState is not None:
+            self.updateQTable(self.lastState, self.lastAction, reward, newState)
+
+
+    def getState(self, lob, countdown):
+        bestBid = lob["bids"]["best"] or 0
+        bestAsk = lob["asks"]["best"] or 0
+        mid = (bestBid + bestAsk) / 2
+        spread = (bestAsk - bestBid) if (bestAsk and bestBid) else 0
+        limit = self.orders[0].price if self.orders else 0
+
+        return (self.bin(bestBid, 10),
+                self.bin(bestAsk, 10),
+                self.bin(spread, 5),
+                self.bin(countdown, 5),
+                self.bin(limit, 10),
+                self.orders[0].otype if self.orders else "Bid")
+
+    def chooseAction(self, state):
+        if random.random() < self.epsilon:
+            return random.randint(0, self.actionSize - 1)
+        qs = [self.qTable.get((state, i), 0.0) for i in range(self.actionSize)]
+        return qs.index(max(qs))
+
+    def actionToPrice(self, action):
+        limit = self.orders[0].price
+        otype = self.orders[0].otype
+        factor = action / (self.actionSize-1)
+
+        if otype == "Bid":
+            return int(limit * (0.8+(0.2*factor)))
+        else:
+            return int(limit * (1.2-(0.2*factor)))
+
+    def computeReward(self, trade):
+        if trade and (trade["party1"] == self.tid or trade["party2"] == self.tid):
+            limit = self.orders[0].price if self.orders else self.lastquote.price
+            if self.orders and self.orders[0].otype == "Bid":
+                profit =  limit - trade["price"]
+            else:
+                profit =  trade["price"] - limit
+            timeBonus = 1 - self.countdown
+            return (profit * (1+timeBonus))
+        return (-0.1 * (1+self.countdown))
+
+    def updateQTable(self, state, action, reward, newState):
+        oldQ = self.qTable.get((state, action), 0.0)
+        newMax = max(self.qTable.get((newState, i), 0.0) for i in range(self.actionSize))
+        newQ = oldQ + (self.alpha * (reward + (self.gamma*newMax) - oldQ))
+        self.qTable[(state, action)] = newQ
+        
+        global prevRLTrader
+        prevRLTrader = {
+            "stateSize": self.stateSize,
+            "actionSize": self.actionSize,
+            "qTable": self.qTable,
+            "epsilon": self.epsilon,
+            "alpha": self.alpha,
+            "gamma": self.gamma,
+            "lastState": self.lastState,
+            "lastAction": self.lastAction,
+        }
+
+    def bin(self, value, numBins):
+        value = max(self.minVal, min(self.maxVal, value))
+        binSize = (self.maxVal - self.minVal) / numBins
+        return int(value / binSize)
 
 # ########################---trader-types have all been defined now--################
 
@@ -2727,6 +2852,8 @@ def populate_market(trdrs_spec, traders, shuffle, vrbs):
             return TraderGiveaway('GVWY', name, balance, parameters, time0)
         elif robottype == "GA":
             return TraderGA("GA", name, balance, parameters, time0)
+        elif robottype == "RL":
+            return TraderRL("RL", name, balance, parameters, time0)
         elif robottype == 'ZIC':
             return TraderZIC('ZIC', name, balance, parameters, time0)
         elif robottype == 'SHVR':
@@ -2808,6 +2935,8 @@ def populate_market(trdrs_spec, traders, shuffle, vrbs):
             else:
                 sys.exit('FAIL: PRZI/PRSH/PRDE trader needs one or more parameters to be specified')
         if ttype == "GA":
+            parameters = trader_params
+        if ttype == "RL":
             parameters = trader_params
                 
         # for PT1/PT2 the parameters are optional...
@@ -3370,8 +3499,9 @@ def gaProfitFromDump(profitFile):
     return profit
         
 
+# Finds a good gene for GA Trader, but also lets the RL Trader build its Q-Table 
 def sessionForGene(gene):
-    # Pretty good Gene -> [ 0.92209201 -0.49358457 -0.7124296  -0.06062575 -0.19027896]
+    # Pretty good Gene -> [ 0.73690529 -0.83849143 -0.79352712 -0.58673848 -0.27918627]
     tid = "ga_trial"
 
     dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True, 'dump_avgbals': True, 'dump_tape': True}
@@ -3380,8 +3510,8 @@ def sessionForGene(gene):
                    'dem': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
                    'interval': 10,
                    'timemode': 'drip-poisson'}
-    buyers_spec = [("ZIC", 10), ("GA", 1, {"genes": gene.tolist()})]
-    sellers_spec = [("ZIC", 10)]
+    buyers_spec = [("ZIC", 5), ("ZIP", 5), ("SHVR", 5), ("GVWY", 5), ("GA", 3, {"genes": gene.tolist()})]
+    sellers_spec = [("ZIC", 5), ("ZIP", 5), ("SHVR", 5), ("GVWY", 5)]
     # print(f"GENE PRE SUB: {gene}")
     proptraders_spec = []
     traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
@@ -3390,13 +3520,42 @@ def sessionForGene(gene):
     gaProfit = gaProfitFromDump(f"{tid}_avg_balance.csv")
     return gaProfit
 
+def rlTrain(sessName):
+    sessions = 1000
+    tid = sessName
+    dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True, 'dump_avgbals': True, 'dump_tape': True}
 
+    order_sched = {'sup': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
+                   'dem': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
+                   'interval': 10,
+                   'timemode': 'drip-poisson'}
+    buyers_spec = [("ZIC", 5), ("ZIP", 5), ("SHVR", 5), ("GVWY", 5), ("RL", 1, {"minVal": 75, "maxVal": 200})]
+    sellers_spec = [("ZIC", 5), ("ZIP", 5), ("SHVR", 5), ("GVWY", 5)]
+    proptraders_spec = []
+    traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
+    
+    for i in range(sessions):
+        market_session(tid, 0, 1200, traders_spec, order_sched, dump_flags, False)
+        # print(f"PREVIOUS TRADER: {prevRLTrader}")
+        buyers_spec = [("ZIC", 5), ("ZIP", 5), ("SHVR", 5), ("GVWY", 5), ("RL", 1, {"minVal": 75, "maxVal": 200})]
+        sellers_spec = [("ZIC", 5), ("ZIP", 5), ("SHVR", 5), ("GVWY", 5)]
+        proptraders_spec = []
+        traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
+        print(f"Session {i} DONE;")
+    
+    return prevRLTrader
 
 
 #############################
 # # Below here is where we set up and run a whole series of experiments
 
 if __name__ == "__main__":
+
+    trainedRLTrader = rlTrain(f"rl_trial0")
+    print(trainedRLTrader)
+    with open("savedRLTrader.pk1", "wb") as f:
+        print(f)
+        pickle.dump(trainedRLTrader, f)
 
     evolver = GAEvolver(
         popSize=20,
@@ -3405,273 +3564,279 @@ if __name__ == "__main__":
     )
     evolver.evolve()
     bestGene = evolver.bestGene
+    evolver.plot()
 
-    # # @TODO Now that the program is outputting a "Best Gene", implement that gene in the experiment below.
-
-    price_offset_filename = 'offset_BTC_USD_20250211.csv'
-
-    # if called from the command line with one argument, the first argument is the price offset filename
-    if len(sys.argv) > 1:
-        price_offset_filename = sys.argv[1]
-
-    # set up common parameters for all market sessions
-    # 1000 days is often good, but 3*365=1095, so may as well go for three years.
-    n_days = 1
-    hours_in_a_day = 1     # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
-    start_time = 0.0
-    end_time = 60.0 * 60.0 * hours_in_a_day * n_days
-    duration = end_time - start_time
+    # bestGene = [0.73690529, -0.83849143, -0.79352712, -0.58673848, -0.27918627]
+    with open("savedGene.pk1", "wb") as f:
+        pickle.dump(bestGene, f)
 
 
-    def schedule_offsetfn_read_file(filename, col_t, col_p, scale_factor=75):
-        """
-        Read in a CSV data-file for the supply/demand schedule time-varying price-offset value
-        :param filename: the CSV file to read
-        :param col_t: column in the CSV that has the time data
-        :param col_p: column in the CSV that has the price data
-        :param scale_factor: multiplier on prices
-        :return: on offset value event-list: one item for each change in offset value
-                -- each item is percentage time elapsed, followed by the new offset value at that time
-        """
+    # # # @TODO Now that the program is outputting a "Best Gene", implement that gene in the experiment below.
+
+    # price_offset_filename = 'offset_BTC_USD_20250211.csv'
+
+    # # if called from the command line with one argument, the first argument is the price offset filename
+    # if len(sys.argv) > 1:
+    #     price_offset_filename = sys.argv[1]
+
+    # # set up common parameters for all market sessions
+    # # 1000 days is often good, but 3*365=1095, so may as well go for three years.
+    # n_days = 1
+    # hours_in_a_day = 1     # how many hours the exchange operates for in a working day (e.g. NYSE = 7.5)
+    # start_time = 0.0
+    # end_time = 60.0 * 60.0 * hours_in_a_day * n_days
+    # duration = end_time - start_time
+
+
+    # def schedule_offsetfn_read_file(filename, col_t, col_p, scale_factor=75):
+    #     """
+    #     Read in a CSV data-file for the supply/demand schedule time-varying price-offset value
+    #     :param filename: the CSV file to read
+    #     :param col_t: column in the CSV that has the time data
+    #     :param col_p: column in the CSV that has the price data
+    #     :param scale_factor: multiplier on prices
+    #     :return: on offset value event-list: one item for each change in offset value
+    #             -- each item is percentage time elapsed, followed by the new offset value at that time
+    #     """
         
-        vrbs = True
+    #     vrbs = True
         
-        # does two passes through the file
-        # assumes data file is all for one date, sorted in time order, in correct format, etc. etc.
-        rwd_csv = csv.reader(open(filename, 'r'))
+    #     # does two passes through the file
+    #     # assumes data file is all for one date, sorted in time order, in correct format, etc. etc.
+    #     rwd_csv = csv.reader(open(filename, 'r'))
         
-        # first pass: get time & price events, find out how long session is, get min & max price
-        minprice = None
-        maxprice = None
-        firsttimeobj = None
-        timesincestart = 0
-        priceevents = []
+    #     # first pass: get time & price events, find out how long session is, get min & max price
+    #     minprice = None
+    #     maxprice = None
+    #     firsttimeobj = None
+    #     timesincestart = 0
+    #     priceevents = []
         
-        first_row_is_header = True
-        this_is_first_row = True
-        this_is_first_data_row = True
-        first_date = None
+    #     first_row_is_header = True
+    #     this_is_first_row = True
+    #     this_is_first_data_row = True
+    #     first_date = None
         
-        for line in rwd_csv:
+    #     for line in rwd_csv:
             
-            if vrbs:
-                print(line)
+    #         if vrbs:
+    #             print(line)
             
-            if this_is_first_row and first_row_is_header:
-                this_is_first_row = False
-                this_is_first_data_row = True
-                continue
+    #         if this_is_first_row and first_row_is_header:
+    #             this_is_first_row = False
+    #             this_is_first_data_row = True
+    #             continue
                 
-            row_date = line[col_t][:10]
+    #         row_date = line[col_t][:10]
             
-            if this_is_first_data_row:
-                first_date = row_date
-                this_is_first_data_row = False
+    #         if this_is_first_data_row:
+    #             first_date = row_date
+    #             this_is_first_data_row = False
                 
-            if row_date != first_date:
-                continue
+    #         if row_date != first_date:
+    #             continue
                 
-            time = line[col_t][11:19]
-            if firsttimeobj is None:
-                firsttimeobj = datetime.strptime(time, '%H:%M:%S')
+    #         time = line[col_t][11:19]
+    #         if firsttimeobj is None:
+    #             firsttimeobj = datetime.strptime(time, '%H:%M:%S')
                 
-            timeobj = datetime.strptime(time, '%H:%M:%S')
+    #         timeobj = datetime.strptime(time, '%H:%M:%S')
             
-            price_str = line[col_p]
-            # delete any commas so 1,000,000 becomes 1000000
-            price_str_no_commas = price_str.replace(',', '')
-            price = float(price_str_no_commas)
+    #         price_str = line[col_p]
+    #         # delete any commas so 1,000,000 becomes 1000000
+    #         price_str_no_commas = price_str.replace(',', '')
+    #         price = float(price_str_no_commas)
             
-            if minprice is None or price < minprice:
-                minprice = price
-            if maxprice is None or price > maxprice:
-                maxprice = price
-            timesincestart = (timeobj - firsttimeobj).total_seconds()
-            priceevents.append([timesincestart, price])
+    #         if minprice is None or price < minprice:
+    #             minprice = price
+    #         if maxprice is None or price > maxprice:
+    #             maxprice = price
+    #         timesincestart = (timeobj - firsttimeobj).total_seconds()
+    #         priceevents.append([timesincestart, price])
             
-            if vrbs:
-                print(row_date, time, timesincestart, price)
+    #         if vrbs:
+    #             print(row_date, time, timesincestart, price)
             
-        # second pass: normalise times to fractions of entire time-series duration
-        #              & normalise price range
-        pricerange = maxprice - minprice
-        endtime = float(timesincestart)
-        offsetfn_eventlist = []
-        for event in priceevents:
-            # normalise price
-            normld_price = (event[1] - minprice) / pricerange
-            # clip
-            normld_price = min(normld_price, 1.0)
-            normld_price = max(0.0, normld_price)
-            # scale & convert to integer cents
-            price = int(round(normld_price * scale_factor))
-            normld_event = [event[0] / endtime, price]
-            if vrbs:
-                print(normld_event)
-            offsetfn_eventlist.append(normld_event)
+    #     # second pass: normalise times to fractions of entire time-series duration
+    #     #              & normalise price range
+    #     pricerange = maxprice - minprice
+    #     endtime = float(timesincestart)
+    #     offsetfn_eventlist = []
+    #     for event in priceevents:
+    #         # normalise price
+    #         normld_price = (event[1] - minprice) / pricerange
+    #         # clip
+    #         normld_price = min(normld_price, 1.0)
+    #         normld_price = max(0.0, normld_price)
+    #         # scale & convert to integer cents
+    #         price = int(round(normld_price * scale_factor))
+    #         normld_event = [event[0] / endtime, price]
+    #         if vrbs:
+    #             print(normld_event)
+    #         offsetfn_eventlist.append(normld_event)
         
-        return offsetfn_eventlist
+    #     return offsetfn_eventlist
 
 
-    def schedule_offsetfn_from_eventlist(time, params):
-        """
-        Returns a price offset-value for the current time, by reading from an offset event-list.
-        :param time: the current time
-        :param params: a list of parameter values...
-            params[1] is the final time (the end-time) of the current session.
-            params[2] is the offset event-list: one item for each change in offset value
-                        -- each item is percentage time elapsed, followed by the new offset value at that time
-        :return: integer price offset value
-        """
+    # def schedule_offsetfn_from_eventlist(time, params):
+    #     """
+    #     Returns a price offset-value for the current time, by reading from an offset event-list.
+    #     :param time: the current time
+    #     :param params: a list of parameter values...
+    #         params[1] is the final time (the end-time) of the current session.
+    #         params[2] is the offset event-list: one item for each change in offset value
+    #                     -- each item is percentage time elapsed, followed by the new offset value at that time
+    #     :return: integer price offset value
+    #     """
 
-        final_time = float(params[0])
-        offset_events = params[1]
-        # this is quite inefficient: on every call it walks the event-list
-        percent_elapsed = time/final_time
-        offset = None
-        for event in offset_events:
-            offset = event[1]
-            if percent_elapsed < event[0]:
-                break
-        return offset
+    #     final_time = float(params[0])
+    #     offset_events = params[1]
+    #     # this is quite inefficient: on every call it walks the event-list
+    #     percent_elapsed = time/final_time
+    #     offset = None
+    #     for event in offset_events:
+    #         offset = event[1]
+    #         if percent_elapsed < event[0]:
+    #             break
+    #     return offset
 
 
-    def schedule_offsetfn_increasing_sinusoid(t, params):
-        """
-        Returns sinusoidal time-dependent price-offset, steadily increasing in frequency & amplitude
-        :param t: time
-        :param params: set of parameters for the offsetfn: this is empty-set for this offsetfn but nonempty in others
-        :return: the time-dependent price offset at time t
-        """
-        if params is None:  # this test of params is here only to prevent PyCharm from warning about unused parameters
-            pass
-        scale = -7500
-        multiplier = 7500000    # determines rate of increase of frequency and amplitude
-        offset = ((scale * t) / multiplier) * (1 + math.sin((t*t)/(multiplier * math.pi)))
-        return int(round(offset, 0))
+    # def schedule_offsetfn_increasing_sinusoid(t, params):
+    #     """
+    #     Returns sinusoidal time-dependent price-offset, steadily increasing in frequency & amplitude
+    #     :param t: time
+    #     :param params: set of parameters for the offsetfn: this is empty-set for this offsetfn but nonempty in others
+    #     :return: the time-dependent price offset at time t
+    #     """
+    #     if params is None:  # this test of params is here only to prevent PyCharm from warning about unused parameters
+    #         pass
+    #     scale = -7500
+    #     multiplier = 7500000    # determines rate of increase of frequency and amplitude
+    #     offset = ((scale * t) / multiplier) * (1 + math.sin((t*t)/(multiplier * math.pi)))
+    #     return int(round(offset, 0))
 
-    # Here is an example of how to use the offset function
-    #
-    # range1 = (10, 190, (schedule_offsetfn, args)) # args is the list of arguments to the function
-    # range2 = (200, 300, (schedule_offsetfn, args))
+    # # Here is an example of how to use the offset function
+    # #
+    # # range1 = (10, 190, (schedule_offsetfn, args)) # args is the list of arguments to the function
+    # # range2 = (200, 300, (schedule_offsetfn, args))
 
-    # Here is an example of how to switch from range1 to range2 and then back to range1,
-    # introducing two "market shocks"
-    # -- here the timings of the shocks are at 1/3 and 2/3 into the duration of the session.
-    #
-    # supply_schedule = [ {'from':start_time, 'to':duration/3, 'ranges':[range1], 'stepmode':'fixed'},
-    #                     {'from':duration/3, 'to':2*duration/3, 'ranges':[range2], 'stepmode':'fixed'},
-    #                     {'from':2*duration/3, 'to':end_time, 'ranges':[range1], 'stepmode':'fixed'}
-    #                   ]
+    # # Here is an example of how to switch from range1 to range2 and then back to range1,
+    # # introducing two "market shocks"
+    # # -- here the timings of the shocks are at 1/3 and 2/3 into the duration of the session.
+    # #
+    # # supply_schedule = [ {'from':start_time, 'to':duration/3, 'ranges':[range1], 'stepmode':'fixed'},
+    # #                     {'from':duration/3, 'to':2*duration/3, 'ranges':[range2], 'stepmode':'fixed'},
+    # #                     {'from':2*duration/3, 'to':end_time, 'ranges':[range1], 'stepmode':'fixed'}
+    # #                   ]
 
-    offsetfn_events = None
-    if price_offset_filename is not None:
-        offsetfn_events = schedule_offsetfn_read_file(price_offset_filename, 0, 1)
+    # offsetfn_events = None
+    # if price_offset_filename is not None:
+    #     offsetfn_events = schedule_offsetfn_read_file(price_offset_filename, 0, 1)
 
-    # supply schedule (defines the supply curve)
-    range1 = (75, 110, (schedule_offsetfn_from_eventlist, [[end_time, offsetfn_events]]))
-    supply_schedule = [{'from': start_time, 'to': end_time, 'ranges': [range1], 'stepmode': 'random'}]
+    # # supply schedule (defines the supply curve)
+    # range1 = (75, 110, (schedule_offsetfn_from_eventlist, [[end_time, offsetfn_events]]))
+    # supply_schedule = [{'from': start_time, 'to': end_time, 'ranges': [range1], 'stepmode': 'random'}]
 
-    # demand schedule (defines the demand curve)
-    range2 = (125, 90, (schedule_offsetfn_from_eventlist, [[end_time, offsetfn_events]]))
-    demand_schedule = [{'from': start_time, 'to': end_time, 'ranges': [range2], 'stepmode': 'random'}]
+    # # demand schedule (defines the demand curve)
+    # range2 = (125, 90, (schedule_offsetfn_from_eventlist, [[end_time, offsetfn_events]]))
+    # demand_schedule = [{'from': start_time, 'to': end_time, 'ranges': [range2], 'stepmode': 'random'}]
 
-    # new customer orders arrive at each trader approx once every order_interval seconds
-    order_interval = 10
+    # # new customer orders arrive at each trader approx once every order_interval seconds
+    # order_interval = 10
 
-    # order schedule wraps up the supply/demand schedules and details of how customer orders/assignments are issued
-    order_sched = {'sup': supply_schedule, 'dem': demand_schedule,
-                   'interval': order_interval, 'timemode': 'drip-poisson'}
+    # # order schedule wraps up the supply/demand schedules and details of how customer orders/assignments are issued
+    # order_sched = {'sup': supply_schedule, 'dem': demand_schedule,
+    #                'interval': order_interval, 'timemode': 'drip-poisson'}
 
-    # now run a sequence of trials, one session per trial
+    # # now run a sequence of trials, one session per trial
 
-    # if verbose = True, print a running commentary describing what's going on.
-    verbose = True
+    # # if verbose = True, print a running commentary describing what's going on.
+    # verbose = True
 
-    # n_trials is how many trials (i.e. market sessions) to run in total
-    n_trials = 1
+    # # n_trials is how many trials (i.e. market sessions) to run in total
+    # n_trials = 1
 
-    # n_recorded is how many trials (i.e. market sessions) to write full data-files for
-    n_trials_recorded = 5
+    # # n_recorded is how many trials (i.e. market sessions) to write full data-files for
+    # n_trials_recorded = 5
 
-    trial = 1
+    # trial = 1
 
-    while trial < (n_trials+1):
+    # while trial < (n_trials+1):
 
-        # create unique i.d. string for this trial
-        trial_id = 'bse_d%03d_i%02d_%04d' % (n_days, order_interval, trial)
+    #     # create unique i.d. string for this trial
+    #     trial_id = 'bse_d%03d_i%02d_%04d' % (n_days, order_interval, trial)
 
-        # buyer_spec specifies the strategies played by buyers, and for each strategy how many such buyers to create
-        buyers_spec = [('ZIC', 10), ('ZIP', 10), ("GA", 1, {"genes": bestGene.tolist()})]
-        #     ('PRZI', 5, {'s_min': -1.0, 's_max': +1.0})]
+    #     # buyer_spec specifies the strategies played by buyers, and for each strategy how many such buyers to create
+    #     buyers_spec = [('ZIC', 10), ('ZIP', 10), ("GA", 1, {"genes": bestGene.tolist()}), ("RL", 1, {"minVal": 75, "maxVal": 200})]
+    #     #     ('PRZI', 5, {'s_min': -1.0, 's_max': +1.0})]
 
-        # seller_spec specifies the strategies played by sellers, and for each strategy how many such sellers to create
-        sellers_spec = [('ZIC', 10), ('ZIP', 10)]
+    #     # seller_spec specifies the strategies played by sellers, and for each strategy how many such sellers to create
+    #     sellers_spec = [('ZIC', 10), ('ZIP', 10)]
 
-        # proptraders_spec specifies strategies played by proprietary-traders, and how many of each
-        # proptraders_spec = [('PT1', 1, {'bid_percent': 0.95, 'ask_delta': 7}), ('PT2', 1, {'n_past_trades': 25})]
-        proptraders_spec = []
+    #     # proptraders_spec specifies strategies played by proprietary-traders, and how many of each
+    #     # proptraders_spec = [('PT1', 1, {'bid_percent': 0.95, 'ask_delta': 7}), ('PT2', 1, {'n_past_trades': 25})]
+    #     proptraders_spec = []
 
-        # trader_spec wraps up the specifications for the buyers, sellers, and proptraders
-        traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
+    #     # trader_spec wraps up the specifications for the buyers, sellers, and proptraders
+    #     traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
 
-        if trial > n_trials_recorded:
-            # switch off recording of detailed data-files
-            dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False,
-                          'dump_avgbals': False, 'dump_tape': False}
-        else:
-            # we're still recording all the required data-files
-            dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True,
-                          'dump_avgbals': True, 'dump_tape': True}
+    #     if trial > n_trials_recorded:
+    #         # switch off recording of detailed data-files
+    #         dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False,
+    #                       'dump_avgbals': False, 'dump_tape': False}
+    #     else:
+    #         # we're still recording all the required data-files
+    #         dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True,
+    #                       'dump_avgbals': True, 'dump_tape': True}
 
-        # simulate the market session
-        market_session(trial_id, start_time, end_time, traders_spec, order_sched, dump_flags, verbose)
+    #     # simulate the market session
+    #     market_session(trial_id, start_time, end_time, traders_spec, order_sched, dump_flags, verbose)
 
-        trial = trial + 1
+    #     trial = trial + 1
 
-    # The code in comments below here is for illustration, in case you want to do an exhaustive sweep of all possible
-    # combinations of some set of trading strategies: if its of no interest, it can be deleted.
-    #
-    # run a sequence of trials that exhaustively varies the ratio of four trader types
-    # NB this has weakness of symmetric proportions on buyers/sellers -- combinatorics of varying that are quite nasty
-    #
-    # n_trader_types = 4
-    # equal_ratio_n = 4
-    # n_trials_per_ratio = 50
-    #
-    # n_traders = n_trader_types * equal_ratio_n
-    #
-    # fname = 'balances_%03d.csv' % equal_ratio_n
-    #
-    # tdump = open(fname, 'w')
-    #
-    # min_n = 1
-    #
-    # trialnumber = 1
-    # trdr_1_n = min_n
-    # while trdr_1_n <= n_traders:
-    #     trdr_2_n = min_n
-    #     while trdr_2_n <= n_traders - trdr_1_n:
-    #         trdr_3_n = min_n
-    #         while trdr_3_n <= n_traders - (trdr_1_n + trdr_2_n):
-    #             trdr_4_n = n_traders - (trdr_1_n + trdr_2_n + trdr_3_n)
-    #             if trdr_4_n >= min_n:
-    #                 buyers_spec = [('GVWY', trdr_1_n), ('SHVR', trdr_2_n),
-    #                                ('ZIC', trdr_3_n), ('ZIP', trdr_4_n)]
-    #                 sellers_spec = buyers_spec
-    #                 traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
-    #                 # print buyers_spec
-    #                 trial = 1
-    #                 while trial <= n_trials_per_ratio:
-    #                     trial_id = 'trial%07d' % trialnumber
-    #                     market_session(trial_id, start_time, end_time, traders_spec,
-    #                                    order_sched, tdump, False, True)
-    #                     tdump.flush()
-    #                     trial = trial + 1
-    #                     trialnumber = trialnumber + 1
-    #             trdr_3_n += 1
-    #         trdr_2_n += 1
-    #     trdr_1_n += 1
-    # tdump.close()
-    #
-    # print(trialnumber)
+    # # The code in comments below here is for illustration, in case you want to do an exhaustive sweep of all possible
+    # # combinations of some set of trading strategies: if its of no interest, it can be deleted.
+    # #
+    # # run a sequence of trials that exhaustively varies the ratio of four trader types
+    # # NB this has weakness of symmetric proportions on buyers/sellers -- combinatorics of varying that are quite nasty
+    # #
+    # # n_trader_types = 4
+    # # equal_ratio_n = 4
+    # # n_trials_per_ratio = 50
+    # #
+    # # n_traders = n_trader_types * equal_ratio_n
+    # #
+    # # fname = 'balances_%03d.csv' % equal_ratio_n
+    # #
+    # # tdump = open(fname, 'w')
+    # #
+    # # min_n = 1
+    # #
+    # # trialnumber = 1
+    # # trdr_1_n = min_n
+    # # while trdr_1_n <= n_traders:
+    # #     trdr_2_n = min_n
+    # #     while trdr_2_n <= n_traders - trdr_1_n:
+    # #         trdr_3_n = min_n
+    # #         while trdr_3_n <= n_traders - (trdr_1_n + trdr_2_n):
+    # #             trdr_4_n = n_traders - (trdr_1_n + trdr_2_n + trdr_3_n)
+    # #             if trdr_4_n >= min_n:
+    # #                 buyers_spec = [('GVWY', trdr_1_n), ('SHVR', trdr_2_n),
+    # #                                ('ZIC', trdr_3_n), ('ZIP', trdr_4_n)]
+    # #                 sellers_spec = buyers_spec
+    # #                 traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
+    # #                 # print buyers_spec
+    # #                 trial = 1
+    # #                 while trial <= n_trials_per_ratio:
+    # #                     trial_id = 'trial%07d' % trialnumber
+    # #                     market_session(trial_id, start_time, end_time, traders_spec,
+    # #                                    order_sched, tdump, False, True)
+    # #                     tdump.flush()
+    # #                     trial = trial + 1
+    # #                     trialnumber = trialnumber + 1
+    # #             trdr_3_n += 1
+    # #         trdr_2_n += 1
+    # #     trdr_1_n += 1
+    # # tdump.close()
+    # #
+    # # print(trialnumber)
