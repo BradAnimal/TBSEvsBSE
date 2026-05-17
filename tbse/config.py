@@ -3,7 +3,8 @@
 
 # General
 sessionLength = 1  # Length of session in seconds.
-virtualSessionLength = 300  # Number of virtual timesteps per sessionLength.
+# Given 7 hours
+virtualSessionLength = 25200  # Number of virtual timesteps per sessionLength.
 verbose = False  # Adds additional output for debugging.
 
 # BSE ONLY
@@ -13,9 +14,9 @@ end_time = 300.0
 # Trader Schedule
 # Define number of each algorithm used one side of exchange (buyers or sellers).
 # Same values will be used to define other side of exchange (buyers = sellers).
-numZIC = 0
+numZIC = 3
 numZIP = 3
-numGDX = 3
+numGDX = 0
 numAA = 0
 numGVWY = 3
 numSHVR = 3

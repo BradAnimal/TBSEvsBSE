@@ -52,6 +52,7 @@ import threading
 import time
 import pickle
 import pygad
+import os
 import numpy as np
 from datetime import datetime
 
@@ -63,6 +64,25 @@ from tbse_trader_agents import TraderGiveaway, TraderShaver, TraderSniper, \
 
 tradersDict = {}
 GENE_BOUNDS = {"low": -1.0, "high": 1.0}
+SESS_LENGTH_TBSE = 100
+VIRTUAL_END_TBSE = 6000
+N_TRIALS = 10
+SUPPLY_RANGES = [(75, 150)]
+DEMAND_RANGES = SUPPLY_RANGES
+STEPMODE = "fixed"
+TIMEMODE = "drip-poisson"
+INTERVAL = 30
+
+N_ZIC = 2
+N_ZIP = 2
+N_GVWY = 2
+N_SHVR = 2
+N_GA = 1
+N_RL = 1
+HEURISTIC_TYPES = ["ZIC", "ZIP", "GVWY", "SHVR"]
+
+
+
 
 # Adapted from original BSE code
 def trade_stats(expid, traders, dumpfile):
@@ -753,12 +773,32 @@ def rlTrain(sessions=1000):
     with open("trainedRLSnapshot.pk1", "wb") as f:
         pickle.dump(agentSnapshot, f)
             
+def runTrial(trialID, bestGene, trainedRLTrader):
+    supply = [{"from": 0.0, "to": VIRTUAL_END_TBSE, "ranges": list(SUPPLY_RANGES), "stepmode": STEPMODE}]
+    demand = [{"from": 0.0, "to": VIRTUAL_END_TBSE, "ranges": list(DEMAND_RANGES), "stepmode": STEPMODE}]
+    orderSched = {"sup": supply, "dem": demand, "interval": INTERVAL, "timemode": TIMEMODE}
+    geneList = trainedGene.tolist() if hasattr(trainedGene, "tolist") else print("Best Gene is WRONG TYPE")
 
+    buyers_spec = [('ZIC', N_ZIC), ('GVWY', N_GVWY), ('ZIP', N_ZIP), ('SHVR', N_SHVR), ("GA", N_GA, {"genes": trainedGene.tolist()}), ("RL", N_RL, {"minVal": 75, "maxVal": 200, "snapshot": trainedSnap})]
+    sellers_spec = [('ZIC', N_ZIC), ('GVWY', N_GVWY), ('ZIP', N_ZIP), ('SHVR', N_SHVR)]
+    traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, "proptraders": []}
+
+    dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False, 'dump_avgbals': False, 'dump_tape': False}
+    
+    traders = singleSess(trialID, SESS_LENGTH_TBSE, VIRTUAL_END_TBSE, traders_spec, orderSched, False)
+    if not traders:
+        return {}
+    
+    results = {}
+    for i in traders.values():
+        ttype = i.ttype
+        results.setdefault(ttype, []).append(i.balance)
+    return results
 
 
 # # Below here is where we set up and run a series of experiments
 
-if __name__ == "__main__":
+if __name__ == "__main__NO_RUN":
     snapshot = rlTrain()
     bestGene = gaEvolve()
     with open("trainedGAGene.pk1", "rb") as f:
@@ -766,216 +806,325 @@ if __name__ == "__main__":
     with open("trainedRLSnapshot.pk1", "rb") as f:
         print(pickle.load(f))
 
-if __name__ == "__main__NO_RUN":
-
+if __name__ == "__main__":
     if not config.parse_config():
         sys.exit()
-
     # Input configuration
     USE_CONFIG = False
     USE_CSV = False
     USE_COMMAND_LINE = False
 
-    NUM_ZIC = config.numZIC
-    NUM_ZIP = config.numZIP
-    NUM_GDX = config.numGDX
-    NUM_AA = config.numAA
-    NUM_GVWY = config.numGVWY
-    NUM_SHVR = config.numSHVR
-    NUM_GA = config.numGA
-    NUM_RL = config.numRL
-
-    NUM_OF_ARGS = len(sys.argv)
-    if NUM_OF_ARGS == 1:
-        USE_CONFIG = True
-    elif NUM_OF_ARGS == 2:
-        USE_CSV = True
-    elif NUM_OF_ARGS == 7:
-        USE_COMMAND_LINE = True
-        try:
-            NUM_ZIC = int(sys.argv[1])
-            NUM_ZIP = int(sys.argv[2])
-            NUM_GDX = int(sys.argv[3])
-            NUM_AA = int(sys.argv[4])
-            NUM_GVWY = int(sys.argv[5])
-            NUM_SHVR = int(sys.argv[6])
-        except ValueError:
-            print("ERROR: Invalid trader schedule. Please enter six integer values.")
-            sys.exit()
+    if not os.path.exists("trainedGAGene.pk1"):
+        print("No Trained Gene")
+        sys.exit()
     else:
-        print("Invalid input arguements.")
-        print("Options for running TBSE:")
-        print("	$ python3 tbse.py  ---  Run using trader schedule from config.")
-        print(" $ python3 tbse.py <string>.csv  ---  Enter name of csv file describing a series of trader schedules.")
-        print(" $ python3 tbse.py <int> <int> <int> <int> <int> <int>  ---  Enter 6 integer values representing trader \
-        schedule.")
+        with open("trainedGAGene.pk1", "rb") as f:
+            trainedGene = pickle.load(f)
+        # print(trainedGene)
+    
+    if not os.path.exists("trainedRLSnapshot.pk1"):
+        print("No Trained RL Snapshot")
         sys.exit()
-    # pylint: disable=too-many-boolean-expressions
-    if NUM_ZIC < 0 or NUM_ZIP < 0 or NUM_GDX < 0 or NUM_AA < 0 or NUM_GVWY < 0 or NUM_SHVR < 0:
-        print("ERROR: Invalid trader schedule. All input integers should be positive.")
-        sys.exit()
-
-    # This section of code allows for the same order and trader schedules
-    # to be tested config.numTrials times.
-
-    if USE_CONFIG or USE_COMMAND_LINE:
-
-        order_sched = get_order_schedule()
-
-        buyers_spec = [('ZIC', NUM_ZIC), ('ZIP', NUM_ZIP),
-                       ('GDX', NUM_GDX), ('AA', NUM_AA),
-                       ('GVWY', NUM_GVWY), ('SHVR', NUM_SHVR),
-                       ("GA", NUM_GA), ("RL", NUM_RL)]
-
-        sellers_spec = buyers_spec
-        traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
-
-        file_name = f"{str(NUM_ZIC).zfill(2)}-{str(NUM_ZIP).zfill(2)}-{str(NUM_GDX).zfill(2)}-" \
-                    f"{str(NUM_AA).zfill(2)}-{str(NUM_GVWY).zfill(2)}-{str(NUM_SHVR).zfill(2)}.csv"
-        with open(file_name, 'w', encoding="utf-8") as tdump:
-
-            trader_count = 0
-            for ttype in buyers_spec:
-                trader_count += ttype[1]
-            for ttype in sellers_spec:
-                trader_count += ttype[1]
-
-            if trader_count > 40:
-                print("WARNING: Too many traders can cause unstable behaviour.")
-
-            trial = 1
-            if config.numTrials > 1:
-                dump_all = False
-            else:
-                dump_all = True
-
-            while trial < (config.numTrials + 1):
-                trial_id = f'trial{str(trial).zfill(7)}'
-                start_session_event = threading.Event()
-                # try:
-                NUM_THREADS = market_session(
-                    trial_id,
-                    config.sessionLength,
-                    config.virtualSessionLength,
-                    traders_spec,
-                    order_sched,
-                    start_session_event,
-                    False)
-
-                if NUM_THREADS != trader_count + 2:
-                    trial = trial - 1
-                    start_session_event.clear()
-                    time.sleep(0.5)
-                # except Exception as e:  # pylint: disable=broad-except
-                #     print("Error: Market session failed, trying again.")
-                #     print(e)
-                #     trial = trial - 1
-                #     start_session_event.clear()
-                #     time.sleep(0.5)
-                tdump.flush()
-                trial = trial + 14
-        print(f"TRADERS: {tradersDict["B02"].genes}")
-
-    # To use this section of code run TBSE with 'python3 tbse.py <csv>'
-    # and have a CSV file with name <string>.csv with a list of values
-    # representing the number of each trader type present in the
-    # market you wish to run. The order is:
-    # 				ZIC,ZIP,GDX,AA,GVWY,SHVR
-    # So an example entry would be: 5,5,0,0,5,5
-    # which would be 5 ZIC traders, 5 ZIP traders, 5 Giveaway traders and
-    # 5 Shaver traders. To have different buyer and seller specs modifications
-    # would be needed.
-
-    elif USE_CSV:
-        server = sys.argv[1]
-        ratios = []
-        try:
-            with open(server, newline='', encoding="utf-8") as csv_file:
-                reader = csv.reader(csv_file, delimiter=',')
-                for row in reader:
-                    ratios.append(row)
-        except FileNotFoundError:
-            print("ERROR: File " + server + " not found.")
-            sys.exit()
-        except IOError as e:
-            print("ERROR: " + e)
-            sys.exit()
-
-        trial_number = 1
-        for ratio in ratios:
-            try:
-                NUM_ZIC = int(ratio[0])
-                NUM_ZIP = int(ratio[1])
-                NUM_GDX = int(ratio[2])
-                NUM_AA = int(ratio[3])
-                NUM_GVWY = int(ratio[4])
-                NUM_SHVR = int(ratio[5])
-            except ValueError:
-                print("ERROR: Invalid trader schedule. Please enter six, comma-separated, integer values. Skipping "
-                      "this trader schedule.")
-                continue
-            except Exception as e:  # pylint: disable=broad-except
-                print("ERROR: Unknown input error. Skipping this trader schedule." + str(e))
-                continue
-            # pylint: disable=too-many-boolean-expressions
-            if NUM_ZIC < 0 or NUM_ZIP < 0 or NUM_GDX < 0 or NUM_AA < 0 or NUM_GVWY < 0 or NUM_SHVR < 0:
-                print("ERROR: Invalid trader schedule. All input integers should be positive. Skipping this trader"
-                      " schedule.")
-                continue
-
-            file_name = f"{str(NUM_ZIC).zfill(2)}-{str(NUM_ZIP).zfill(2)}-{str(NUM_GDX).zfill(2)}-" \
-                        f"{str(NUM_AA).zfill(2)}-{str(NUM_GVWY).zfill(2)}-{str(NUM_SHVR).zfill(2)}.csv"
-            with open(file_name, 'w', encoding="utf-8") as tdump:
-
-                for _ in range(0, config.numSchedulesPerRatio):
-
-                    order_sched = get_order_schedule()
-
-                    buyers_spec = [('ZIC', NUM_ZIC), ('ZIP', NUM_ZIP),
-                                   ('GDX', NUM_GDX), ('AA', NUM_AA),
-                                   ('GVWY', NUM_GVWY), ('SHVR', NUM_SHVR)]
-
-                    sellers_spec = buyers_spec
-                    traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
-
-                    trader_count = 0
-                    for ttype in buyers_spec:
-                        trader_count += ttype[1]
-                    for ttype in sellers_spec:
-                        trader_count += ttype[1]
-
-                    if trader_count > 40:
-                        print("WARNING: Too many traders can cause unstable behaviour.")
-
-                    trial = 1
-                    while trial <= config.numTrialsPerSchedule:
-                        trial_id = f'trial{str(trial_number).zfill(7)}'
-                        start_session_event = threading.Event()
-                        try:
-                            NUM_THREADS = market_session(trial_id,
-                                                         config.sessionLength,
-                                                         config.virtualSessionLength,
-                                                         traders_spec,
-                                                         order_sched,
-                                                         start_session_event,
-                                                         False)
-                            if NUM_THREADS != trader_count + 2:
-                                trial = trial - 1
-                                trial_number = trial_number - 1
-                                start_session_event.clear()
-                                time.sleep(0.5)
-                        except Exception as e:  # pylint: disable=broad-except
-                            print("Market session failed. Trying again. " + str(e))
-                            trial = trial - 1
-                            trial_number = trial_number - 1
-                            start_session_event.clear()
-                            time.sleep(0.5)
-                        tdump.flush()
-                        trial = trial + 1
-                        trial_number = trial_number + 1
-
-        sys.exit('Done Now')
-
     else:
-        print("ERROR: An unknown error has occurred. Something is very wrong.")
-        sys.exit()
+        with open("trainedRLSnapshot.pk1", "rb") as f:
+            trainedSnap = pickle.load(f)
+    
+    results = {}
+    rawRows = [["trial", "engine", "trader_type", "balance"]]
+
+    for i in range(1, N_TRIALS+1):
+        tid = f"tbse_trial_{i:04d}"
+        # try:
+        out = runTrial(tid, trainedGene, trainedSnap)
+        # except Exception as e:
+        #     print(f"BSE RUN FAILED: {e}")
+        #     out = {}
+        
+        for ttype, bals in out.items():
+            results.setdefault(ttype, []).extend(bals)
+            for j in bals:
+                rawRows.append([i, "TBSE", ttype, j])
+        print("TBSE DONE")
+    
+    with open("tbseRaw.csv", "w") as f:
+        csv.writer(f).writerows(rawRows)
+
+
+
+    # buyers_spec = [('ZIC', NUM_ZIC), ('ZIP', NUM_ZIP),
+    #                 ('GDX', NUM_GDX), ('AA', NUM_AA),
+    #                 ('GVWY', NUM_GVWY), ('SHVR', NUM_SHVR),
+    #                 ("GA", NUM_GA, {"genes": trainedGene.tolist()}), ("RL", NUM_RL, {"minVal": 75, "maxVal": 200, "snapshot": trainedSnap})]
+
+    # sellers_spec = [('ZIC', NUM_ZIC), ('ZIP', NUM_ZIP),
+    #                 ('GDX', NUM_GDX), ('AA', NUM_AA),
+    #                 ('GVWY', NUM_GVWY), ('SHVR', NUM_SHVR)]
+    # traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
+
+    # file_name = f"{str(NUM_ZIC).zfill(2)}-{str(NUM_ZIP).zfill(2)}-{str(NUM_GDX).zfill(2)}-" \
+    #             f"{str(NUM_AA).zfill(2)}-{str(NUM_GVWY).zfill(2)}-{str(NUM_SHVR).zfill(2)}.csv"
+    # with open(file_name, 'w', encoding="utf-8") as tdump:
+
+    #     trader_count = 0
+    #     for ttype in buyers_spec:
+    #         trader_count += ttype[1]
+    #     for ttype in sellers_spec:
+    #         trader_count += ttype[1]
+
+    #     if trader_count > 40:
+    #         print("WARNING: Too many traders can cause unstable behaviour.")
+
+    #     trial = 1
+    #     if config.numTrials > 1:
+    #         dump_all = False
+    #     else:
+    #         dump_all = True
+
+    #     while trial < (config.numTrials + 1):
+    #         trial_id = f'trial{str(trial).zfill(7)}'
+    #         start_session_event = threading.Event()
+    #         try:
+    #             NUM_THREADS = market_session(
+    #                 trial_id,
+    #                 config.sessionLength,
+    #                 config.virtualSessionLength,
+    #                 traders_spec,
+    #                 order_sched,
+    #                 start_session_event,
+    #                 False)
+
+    #             if NUM_THREADS != trader_count + 2:
+    #                 trial = trial - 1
+    #                 start_session_event.clear()
+    #                 time.sleep(0.5)
+    #         except Exception as e:  # pylint: disable=broad-except
+    #             print("Error: Market session failed, trying again.")
+    #             print(e)
+    #             trial = trial - 1
+    #             start_session_event.clear()
+    #             time.sleep(0.5)
+    #         tdump.flush()
+    #         trial = trial + 1
+
+    # NUM_ZIC = config.numZIC
+    # NUM_ZIP = config.numZIP
+    # NUM_GDX = config.numGDX
+    # NUM_AA = config.numAA
+    # NUM_GVWY = config.numGVWY
+    # NUM_SHVR = config.numSHVR
+    # NUM_GA = config.numGA
+    # NUM_RL = config.numRL
+
+    # NUM_OF_ARGS = len(sys.argv)
+    # if NUM_OF_ARGS == 1:
+    #     USE_CONFIG = True
+    # elif NUM_OF_ARGS == 2:
+    #     USE_CSV = True
+    # elif NUM_OF_ARGS == 7:
+    #     USE_COMMAND_LINE = True
+    #     try:
+    #         NUM_ZIC = int(sys.argv[1])
+    #         NUM_ZIP = int(sys.argv[2])
+    #         NUM_GDX = int(sys.argv[3])
+    #         NUM_AA = int(sys.argv[4])
+    #         NUM_GVWY = int(sys.argv[5])
+    #         NUM_SHVR = int(sys.argv[6])
+    #     except ValueError:
+    #         print("ERROR: Invalid trader schedule. Please enter six integer values.")
+    #         sys.exit()
+    # else:
+    #     print("Invalid input arguements.")
+    #     print("Options for running TBSE:")
+    #     print("	$ python3 tbse.py  ---  Run using trader schedule from config.")
+    #     print(" $ python3 tbse.py <string>.csv  ---  Enter name of csv file describing a series of trader schedules.")
+    #     print(" $ python3 tbse.py <int> <int> <int> <int> <int> <int>  ---  Enter 6 integer values representing trader \
+    #     schedule.")
+    #     sys.exit()
+    # # pylint: disable=too-many-boolean-expressions
+    # if NUM_ZIC < 0 or NUM_ZIP < 0 or NUM_GDX < 0 or NUM_AA < 0 or NUM_GVWY < 0 or NUM_SHVR < 0:
+    #     print("ERROR: Invalid trader schedule. All input integers should be positive.")
+    #     sys.exit()
+
+    # # This section of code allows for the same order and trader schedules
+    # # to be tested config.numTrials times.
+
+    # if USE_CONFIG or USE_COMMAND_LINE:
+
+    #     order_sched = get_order_schedule()
+
+    #     if not os.path.exists("trainedGAGene.pk1"):
+    #         print("No Trained Gene")
+    #         sys.exit()
+    #     else:
+    #         with open("trainedGAGene.pk1", "rb") as f:
+    #             trainedGene = pickle.load(f)
+    #         # print(trainedGene)
+        
+    #     if not os.path.exists("trainedRLSnapshot.pk1"):
+    #         print("No Trained RL Snapshot")
+    #         sys.exit()
+    #     else:
+    #         with open("trainedRLSnapshot.pk1", "rb") as f:
+    #             trainedSnap = pickle.load(f)
+    #         # print(trainedSnap)
+
+
+    #     buyers_spec = [('ZIC', NUM_ZIC), ('ZIP', NUM_ZIP),
+    #                    ('GDX', NUM_GDX), ('AA', NUM_AA),
+    #                    ('GVWY', NUM_GVWY), ('SHVR', NUM_SHVR),
+    #                    ("GA", NUM_GA, {"genes": trainedGene.tolist()}), ("RL", NUM_RL, {"minVal": 75, "maxVal": 200, "snapshot": trainedSnap})]
+
+    #     sellers_spec = [('ZIC', NUM_ZIC), ('ZIP', NUM_ZIP),
+    #                    ('GDX', NUM_GDX), ('AA', NUM_AA),
+    #                    ('GVWY', NUM_GVWY), ('SHVR', NUM_SHVR)]
+    #     traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
+
+    #     file_name = f"{str(NUM_ZIC).zfill(2)}-{str(NUM_ZIP).zfill(2)}-{str(NUM_GDX).zfill(2)}-" \
+    #                 f"{str(NUM_AA).zfill(2)}-{str(NUM_GVWY).zfill(2)}-{str(NUM_SHVR).zfill(2)}.csv"
+    #     with open(file_name, 'w', encoding="utf-8") as tdump:
+
+    #         trader_count = 0
+    #         for ttype in buyers_spec:
+    #             trader_count += ttype[1]
+    #         for ttype in sellers_spec:
+    #             trader_count += ttype[1]
+
+    #         if trader_count > 40:
+    #             print("WARNING: Too many traders can cause unstable behaviour.")
+
+    #         trial = 1
+    #         if config.numTrials > 1:
+    #             dump_all = False
+    #         else:
+    #             dump_all = True
+
+    #         while trial < (config.numTrials + 1):
+    #             trial_id = f'trial{str(trial).zfill(7)}'
+    #             start_session_event = threading.Event()
+    #             try:
+    #                 NUM_THREADS = market_session(
+    #                     trial_id,
+    #                     config.sessionLength,
+    #                     config.virtualSessionLength,
+    #                     traders_spec,
+    #                     order_sched,
+    #                     start_session_event,
+    #                     False)
+
+    #                 if NUM_THREADS != trader_count + 2:
+    #                     trial = trial - 1
+    #                     start_session_event.clear()
+    #                     time.sleep(0.5)
+    #             except Exception as e:  # pylint: disable=broad-except
+    #                 print("Error: Market session failed, trying again.")
+    #                 print(e)
+    #                 trial = trial - 1
+    #                 start_session_event.clear()
+    #                 time.sleep(0.5)
+    #             tdump.flush()
+    #             trial = trial + 1
+        
+
+    # # To use this section of code run TBSE with 'python3 tbse.py <csv>'
+    # # and have a CSV file with name <string>.csv with a list of values
+    # # representing the number of each trader type present in the
+    # # market you wish to run. The order is:
+    # # 				ZIC,ZIP,GDX,AA,GVWY,SHVR
+    # # So an example entry would be: 5,5,0,0,5,5
+    # # which would be 5 ZIC traders, 5 ZIP traders, 5 Giveaway traders and
+    # # 5 Shaver traders. To have different buyer and seller specs modifications
+    # # would be needed.
+
+    # elif USE_CSV:
+    #     server = sys.argv[1]
+    #     ratios = []
+    #     try:
+    #         with open(server, newline='', encoding="utf-8") as csv_file:
+    #             reader = csv.reader(csv_file, delimiter=',')
+    #             for row in reader:
+    #                 ratios.append(row)
+    #     except FileNotFoundError:
+    #         print("ERROR: File " + server + " not found.")
+    #         sys.exit()
+    #     except IOError as e:
+    #         print("ERROR: " + e)
+    #         sys.exit()
+
+    #     trial_number = 1
+    #     for ratio in ratios:
+    #         try:
+    #             NUM_ZIC = int(ratio[0])
+    #             NUM_ZIP = int(ratio[1])
+    #             NUM_GDX = int(ratio[2])
+    #             NUM_AA = int(ratio[3])
+    #             NUM_GVWY = int(ratio[4])
+    #             NUM_SHVR = int(ratio[5])
+    #         except ValueError:
+    #             print("ERROR: Invalid trader schedule. Please enter six, comma-separated, integer values. Skipping "
+    #                   "this trader schedule.")
+    #             continue
+    #         except Exception as e:  # pylint: disable=broad-except
+    #             print("ERROR: Unknown input error. Skipping this trader schedule." + str(e))
+    #             continue
+    #         # pylint: disable=too-many-boolean-expressions
+    #         if NUM_ZIC < 0 or NUM_ZIP < 0 or NUM_GDX < 0 or NUM_AA < 0 or NUM_GVWY < 0 or NUM_SHVR < 0:
+    #             print("ERROR: Invalid trader schedule. All input integers should be positive. Skipping this trader"
+    #                   " schedule.")
+    #             continue
+
+    #         file_name = f"{str(NUM_ZIC).zfill(2)}-{str(NUM_ZIP).zfill(2)}-{str(NUM_GDX).zfill(2)}-" \
+    #                     f"{str(NUM_AA).zfill(2)}-{str(NUM_GVWY).zfill(2)}-{str(NUM_SHVR).zfill(2)}.csv"
+    #         with open(file_name, 'w', encoding="utf-8") as tdump:
+
+    #             for _ in range(0, config.numSchedulesPerRatio):
+
+    #                 order_sched = get_order_schedule()
+
+    #                 buyers_spec = [('ZIC', NUM_ZIC), ('ZIP', NUM_ZIP),
+    #                                ('GDX', NUM_GDX), ('AA', NUM_AA),
+    #                                ('GVWY', NUM_GVWY), ('SHVR', NUM_SHVR)]
+
+    #                 sellers_spec = buyers_spec
+    #                 traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec}
+
+    #                 trader_count = 0
+    #                 for ttype in buyers_spec:
+    #                     trader_count += ttype[1]
+    #                 for ttype in sellers_spec:
+    #                     trader_count += ttype[1]
+
+    #                 if trader_count > 40:
+    #                     print("WARNING: Too many traders can cause unstable behaviour.")
+
+    #                 trial = 1
+    #                 while trial <= config.numTrialsPerSchedule:
+    #                     trial_id = f'trial{str(trial_number).zfill(7)}'
+    #                     start_session_event = threading.Event()
+    #                     try:
+    #                         NUM_THREADS = market_session(trial_id,
+    #                                                      config.sessionLength,
+    #                                                      config.virtualSessionLength,
+    #                                                      traders_spec,
+    #                                                      order_sched,
+    #                                                      start_session_event,
+    #                                                      False)
+    #                         if NUM_THREADS != trader_count + 2:
+    #                             trial = trial - 1
+    #                             trial_number = trial_number - 1
+    #                             start_session_event.clear()
+    #                             time.sleep(0.5)
+    #                     except Exception as e:  # pylint: disable=broad-except
+    #                         print("Market session failed. Trying again. " + str(e))
+    #                         trial = trial - 1
+    #                         trial_number = trial_number - 1
+    #                         start_session_event.clear()
+    #                         time.sleep(0.5)
+    #                     tdump.flush()
+    #                     trial = trial + 1
+    #                     trial_number = trial_number + 1
+
+    #     sys.exit('Done Now')
+
+    # else:
+    #     print("ERROR: An unknown error has occurred. Something is very wrong.")
+    #     sys.exit()

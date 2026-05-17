@@ -179,9 +179,9 @@ class TraderZic(Trader):
             order = None
         else:
             coid = max(self.orders.keys())
-            min_price = lob['bids']['worst']
-            max_price = lob['asks']['worst']
-            limit = self.orders[coid].price
+            min_price = int(lob['bids']['worst'])
+            max_price = int(lob['asks']['worst'])
+            limit = int(self.orders[coid].price)
             otype = self.orders[coid].otype
             if otype == 'Bid':
                 quote_price = random.randint(min_price, limit)
@@ -210,7 +210,7 @@ class TraderShaver(Trader):
             order = None
         else:
             coid = max(self.orders.keys())
-            limit_price = self.orders[coid].price
+            limit_price = int(self.orders[coid].price)
             otype = self.orders[coid].otype
             if otype == 'Bid':
                 if lob['bids']['n'] > 0:
@@ -250,7 +250,7 @@ class TraderSniper(Trader):
             order = None
         else:
             coid = max(self.orders.keys())
-            limit_price = self.orders[coid].price
+            limit_price = int(self.orders[coid].price)
             otype = self.orders[coid].otype
 
             if otype == 'Bid':
