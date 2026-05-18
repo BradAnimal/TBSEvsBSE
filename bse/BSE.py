@@ -59,8 +59,13 @@ import csv
 import pygad
 import pickle
 import copy
+import matplotlib
 from datetime import datetime
 import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+# matplotlib.use("Agg")
 
 NUM_GENES = 5
 GENE_BOUNDS = {"low": -1.0, "high": 1.0}
@@ -3534,36 +3539,36 @@ def sessionForGene(gene):
 
     dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True, 'dump_avgbals': True, 'dump_tape': True}
 
-    order_sched = {'sup': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
-                   'dem': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
-                   'interval': 10,
-                   'timemode': 'drip-poisson'}
+    order_sched = {'sup': [{"from": BSE_START, "to": BSE_END, "ranges": list(SUPPLY_RANGES), "stepmode": STEPMODE}],
+                   'dem': [{"from": BSE_START, "to": BSE_END, "ranges": list(DEMAND_RANGES), "stepmode": STEPMODE}],
+                   'interval': INTERVAL,
+                   'timemode': TIMEMODE}
     buyers_spec = [("ZIC", 2), ("ZIP", 2), ("SHVR", 2), ("GVWY", 2), ("GA", 3, {"genes": gene.tolist()})]
     sellers_spec = [("ZIC", 2), ("ZIP", 2), ("SHVR", 2), ("GVWY", 2)]
     # print(f"GENE PRE SUB: {gene}")
     proptraders_spec = []
     traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
 
-    market_session(tid, 0, 1200, traders_spec, order_sched, dump_flags, False)
+    market_session(tid, BSE_START, BSE_END, traders_spec, order_sched, dump_flags, False)
     gaProfit = gaProfitFromDump(f"{tid}_avg_balance.csv")
     return gaProfit
 
 def rlTrain(sessName):
-    sessions = 1000
+    sessions = 100
     tid = sessName
     dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True, 'dump_avgbals': True, 'dump_tape': True}
 
-    order_sched = {'sup': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
-                   'dem': [{"from": 0, "to": 1200, "ranges": [(50, 150)], "stepmode": "fixed"}],
-                   'interval': 10,
-                   'timemode': 'drip-poisson'}
+    order_sched = {'sup': [{"from": BSE_START, "to": BSE_END, "ranges": list(SUPPLY_RANGES), "stepmode": STEPMODE}],
+                   'dem': [{"from": BSE_START, "to": BSE_END, "ranges": list(DEMAND_RANGES), "stepmode": STEPMODE}],
+                   'interval': INTERVAL,
+                   'timemode': TIMEMODE}
     buyers_spec = [("ZIC", 2), ("ZIP", 2), ("SHVR", 2), ("GVWY", 2), ("RL", 3, {"minVal": 75, "maxVal": 200})]
     sellers_spec = [("ZIC", 2), ("ZIP", 2), ("SHVR", 2), ("GVWY", 2)]
     proptraders_spec = []
     traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, 'proptraders': proptraders_spec}
     
     for i in range(sessions):
-        market_session(tid, 0, 1200, traders_spec, order_sched, dump_flags, False)
+        market_session(tid, BSE_START, BSE_END, traders_spec, order_sched, dump_flags, False)
         # print(f"PREVIOUS TRADER: {prevRLTrader}")
         buyers_spec = [("ZIC", 2), ("ZIP", 2), ("SHVR", 2), ("GVWY", 2), ("RL", 3, {"minVal": 75, "maxVal": 200})]
         sellers_spec = [("ZIC", 2), ("ZIP", 2), ("SHVR", 2), ("GVWY", 2)]
@@ -3587,7 +3592,7 @@ def runTrial(trialID, bestGene, trainedRLTrader):
     sellers_spec = [('ZIC', N_ZIC), ('GVWY', N_GVWY), ('ZIP', N_ZIP), ('SHVR', N_SHVR)]
     traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, "proptraders": []}
 
-    dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False, 'dump_avgbals': False, 'dump_tape': False}
+    dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False, 'dump_avgbals': True, 'dump_tape': False}
     global captured
 
     
@@ -3601,8 +3606,66 @@ def runTrial(trialID, bestGene, trainedRLTrader):
         result.setdefault(ttype, []).append(i.balance)
     return result
 
+def bseSummarise(filePath):
+    if not os.path.exists(filePath):
+        print("No Results To Summarise")
+        sys.exit()
+    else:
+        result = pd.read_csv(filePath)
+
+    summary = (result.groupby(["trader_type"])["balance"].agg(
+        n="count",
+        mean="mean",
+        std="std",
+        min="min",
+        max="max",
+        zeros=lambda x: (x == 0).sum()
+    ).round(2).reset_index())
+
+    summary.to_csv("bseComparison.csv", index=False)
+    print(summary.to_string(index=False))
+    return summary
+
+def plotBoxplots(filePath):
+    result = pd.read_csv(filePath)
+    plt.figure()
+    sns.boxplot(y="trader_type", x="balance", data=result)
+    plt.xlabel("Trader Type")
+    plt.ylabel("Balance")
+    plt.title("Dist. of Trader Profits")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+        
+def plotBarWithErrors(summary):
+    plt.figure()
+    plt.bar(summary["trader_type"], summary["mean"])
+    plt.xlabel("Trader Type")
+    plt.ylabel("Mean Balance")
+    plt.title("Average Profit per Trader Type")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+def plotZeros(summary):
+    plt.figure()
+    plt.bar(summary["trader_type"], summary["zeros"])
+    plt.xlabel("Trader Type")
+    plt.ylabel("No. of Runs with No Profit")
+    plt.title("Failure Rate per Trader Type")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+
 #############################
 # # Below here is where we set up and run a whole series of experiments
+if __name__ == "__main__NOT_RUN":
+    summary = bseSummarise("bseRaw.csv")
+    plotBarWithErrors(summary)
+    plotZeros(summary)
+    plotBoxplots("bseRaw.csv")
+
 
 if __name__ == "__main__":
     if not os.path.exists("savedGene.pk1"):
@@ -3638,25 +3701,25 @@ if __name__ == "__main__":
     with open("bseRaw.csv", "w") as f:
         csv.writer(f).writerows(rawRows)
 
-    
-    # trainedRLTrader = rlTrain(f"rl_trial0")
-    # print(trainedRLTrader)
-    # with open("savedRLTrader.pk1", "wb") as f:
-    #     print(f)
-    #     pickle.dump(trainedRLTrader, f)
+if __name__ == "__main__NOT_MAIN":
+    trainedRLTrader = rlTrain(f"rl_trial0")
+    print(trainedRLTrader)
+    with open("savedRLTrader.pk1", "wb") as f:
+        print(f)
+        pickle.dump(trainedRLTrader, f)
 
-    # evolver = GAEvolver(
-    #     popSize=20,
-    #     numGen=30,
-    #     sessionBuilder=sessionForGene
-    # )
-    # evolver.evolve()
-    # bestGene = evolver.bestGene
+    evolver = GAEvolver(
+        popSize=20,
+        numGen=30,
+        sessionBuilder=sessionForGene
+    )
+    evolver.evolve()
+    bestGene = evolver.bestGene
     # evolver.plot()
 
-    # # bestGene = [0.73690529, -0.83849143, -0.79352712, -0.58673848, -0.27918627]
-    # with open("savedGene.pk1", "wb") as f:
-    #     pickle.dump(bestGene, f)
+    # bestGene = [0.73690529, -0.83849143, -0.79352712, -0.58673848, -0.27918627]
+    with open("savedGene.pk1", "wb") as f:
+        pickle.dump(bestGene, f)
 
     
     # # @TODO Now that the program is outputting a "Best Gene", implement that gene in the experiment below.

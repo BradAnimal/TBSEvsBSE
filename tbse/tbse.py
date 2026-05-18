@@ -53,7 +53,11 @@ import time
 import pickle
 import pygad
 import os
+import matplotlib
 import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 from datetime import datetime
 
 import config
@@ -425,6 +429,7 @@ def market_session(
 
     cuid = 0  # Customer order id
 
+
     while time.time() < (start_time + sess_length):
         virtual_time = (time.time() - start_time) * (virtual_end / sess_length)
         # distribute customer orders
@@ -441,8 +446,6 @@ def market_session(
                     kill_q.put(traders[kill].last_quote)
                     if verbose:
                         print(f'Killing order {str(traders[kill].last_quote)}')
-        time.sleep(0.01)
-
     start_event.clear()
     len_threads = len(threading.enumerate())
 
@@ -527,6 +530,11 @@ def singleSess(sess_id, sess_length, virtual_end,trader_spec, order_schedule, ve
         print(f'\n{sess_id};  ')
 
     cuid = 0  # Customer order id
+    
+    snapshotInterval = 1.0
+    lastSnapshot = start_time
+    balanceLog = open(f"{sess_id}_avg_balance.csv", "w")
+    balanceLog.write("virtual_time,trader_id,trader_type,balance\n")
 
     while time.time() < (start_time + sess_length):
         virtual_time = (time.time() - start_time) * (virtual_end / sess_length)
@@ -544,8 +552,16 @@ def singleSess(sess_id, sess_length, virtual_end,trader_spec, order_schedule, ve
                     kill_q.put(traders[kill].last_quote)
                     if verbose:
                         print(f'Killing order {str(traders[kill].last_quote)}')
+        now = time.time()
+        if now - lastSnapshot >= snapshotInterval:
+            virtTime = (now - start_time) * (virtual_end / sess_length)
+            for tid, trader in traders.items():
+                balanceLog.write(f"{virtTime:.2f},{tid},{trader.ttype},{trader.balance}\n")
+            balanceLog.flush()
+            lastSnapshot = now
         time.sleep(0.01)
 
+    balanceLog.close()
     start_event.clear()
     len_threads = len(threading.enumerate())
 
@@ -683,16 +699,19 @@ def get_offset_event_list():
 
 
 def gaFitness(ga, gene, solIndex):
-    orderSchedule = get_order_schedule()
+    supply = [{"from": 0.0, "to": VIRTUAL_END_TBSE, "ranges": list(SUPPLY_RANGES), "stepmode": STEPMODE}]
+    demand = [{"from": 0.0, "to": VIRTUAL_END_TBSE, "ranges": list(DEMAND_RANGES), "stepmode": STEPMODE}]
+    orderSchedule = {"sup": supply, "dem": demand, "interval": INTERVAL, "timemode": TIMEMODE}
+    # orderSchedule = get_order_schedule()
 
     balances = []
     for i in range(5):
         bSpec = [('ZIC', 2), ('ZIP', 2), ('GVWY', 2), ('SHVR', 2), ("GA", 3, {"genes": gene.tolist()})]
         sSpec = [('ZIC', 2), ('ZIP', 2), ('GVWY', 2), ('SHVR', 2)]
         tradersSpec = {"buyers": bSpec, "sellers": sSpec}
-        sessID = f"rl_train_{i}"
+        sessID = f"ga_train_{i}"
 
-        traders = singleSess(sessID, 5, 300, tradersSpec, orderSchedule, False)
+        traders = singleSess(sessID, SESS_LENGTH_TBSE, VIRTUAL_END_TBSE, tradersSpec, orderSchedule, False)
         # print(traders.values())
         if not traders:
             print(f"session {sessID} failed.")
@@ -712,7 +731,7 @@ def gaFitness(ga, gene, solIndex):
         
     return float(np.mean(balances)) if balances else 0.0
 
-def gaEvolve(numGen=30, popSize=20):
+def gaEvolve(numGen=10, popSize=20):
     ga = pygad.GA(
         num_generations=numGen,
         num_parents_mating=max(2, popSize // 4),
@@ -738,13 +757,13 @@ def gaEvolve(numGen=30, popSize=20):
         pickle.dump(solution, f)
     return solution
 
-def rlTrain(sessions=1000):
+def rlTrain(sessions=100):
     agentSnapshot = None
 
-    supply = [{"from": 0, "to": 600, "ranges": [(50, 150)], "stepmode": "random"}]
-    demand = [{"from": 0, "to": 600, "ranges": [(50, 150)], "stepmode": "random"}]
-    # orderSchedule = {"sup": supply, "dem": demand, "interval": 10, "timemode": "drip-poisson"}
-    orderSchedule = get_order_schedule()
+    supply = [{"from": 0.0, "to": VIRTUAL_END_TBSE, "ranges": list(SUPPLY_RANGES), "stepmode": STEPMODE}]
+    demand = [{"from": 0.0, "to": VIRTUAL_END_TBSE, "ranges": list(DEMAND_RANGES), "stepmode": STEPMODE}]
+    orderSchedule = {"sup": supply, "dem": demand, "interval": INTERVAL, "timemode": TIMEMODE}
+    # orderSchedule = get_order_schedule()
 
     for i in range(sessions):
         bSpec = [('ZIC', 2), ('ZIP', 2), ('GVWY', 2), ('SHVR', 2), ("RL", 3, {"minVal": 75, "maxVal": 200, "snapshot": agentSnapshot})]
@@ -753,7 +772,7 @@ def rlTrain(sessions=1000):
         numAgents = 9 # UPDATE WITH BUYER + SELLER SPEC
         sessID = f"rl_train_{i}"
 
-        traders = singleSess(sessID, 5, 300, tradersSpec, orderSchedule, False)
+        traders = singleSess(sessID, SESS_LENGTH_TBSE, VIRTUAL_END_TBSE, tradersSpec, orderSchedule, False)
         # print(traders.values())
         if not traders:
             print(f"session {sessID} failed.")
@@ -783,7 +802,7 @@ def runTrial(trialID, bestGene, trainedRLTrader):
     sellers_spec = [('ZIC', N_ZIC), ('GVWY', N_GVWY), ('ZIP', N_ZIP), ('SHVR', N_SHVR)]
     traders_spec = {'sellers': sellers_spec, 'buyers': buyers_spec, "proptraders": []}
 
-    dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False, 'dump_avgbals': False, 'dump_tape': False}
+    dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False, 'dump_avgbals': True, 'dump_tape': False}
     
     traders = singleSess(trialID, SESS_LENGTH_TBSE, VIRTUAL_END_TBSE, traders_spec, orderSched, False)
     if not traders:
@@ -795,6 +814,56 @@ def runTrial(trialID, bestGene, trainedRLTrader):
         results.setdefault(ttype, []).append(i.balance)
     return results
 
+def tbseSummarise(filePath):
+    if not os.path.exists(filePath):
+        print("No Results To Summarise")
+        sys.exit()
+    else:
+        result = pd.read_csv(filePath)
+
+    summary = (result.groupby(["trader_type"])["balance"].agg(
+        n="count",
+        mean="mean",
+        std="std",
+        min="min",
+        max="max",
+        zeros=lambda x: (x == 0).sum()
+    ).round(2).reset_index())
+
+    summary.to_csv("tbseComparison.csv", index=False)
+    print(summary.to_string(index=False))
+    return summary
+
+def plotBoxplots(filePath):
+    result = pd.read_csv(filePath)
+    plt.figure()
+    sns.boxplot(y="trader_type", x="balance", data=result)
+    plt.xlabel("Trader Type")
+    plt.ylabel("Balance")
+    plt.title("Dist. of Trader Profits")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+        
+def plotBarWithErrors(summary):
+    plt.figure()
+    plt.bar(summary["trader_type"], summary["mean"])
+    plt.xlabel("Trader Type")
+    plt.ylabel("Mean Balance")
+    plt.title("Average Profit per Trader Type")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+def plotZeros(summary):
+    plt.figure()
+    plt.bar(summary["trader_type"], summary["zeros"])
+    plt.xlabel("Trader Type")
+    plt.ylabel("No. of Runs with No Profit")
+    plt.title("Failure Rate per Trader Type")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
 
 # # Below here is where we set up and run a series of experiments
 
@@ -805,6 +874,12 @@ if __name__ == "__main__NO_RUN":
         print(pickle.load(f))
     with open("trainedRLSnapshot.pk1", "rb") as f:
         print(pickle.load(f))
+
+if __name__ == "__main__NO_RUN":
+    summary = tbseSummarise("tbseRaw.csv")
+    plotBarWithErrors(summary)
+    plotZeros(summary)
+    plotBoxplots("tbseRaw.csv")
 
 if __name__ == "__main__":
     if not config.parse_config():
